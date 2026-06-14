@@ -1,0 +1,81 @@
+from pathlib import Path
+import re
+
+import yaml
+
+
+class SchemaRegistry:
+    def __init__(self, registry_path):
+        self.registry_path = Path(registry_path)
+        self._data = self._load_registry()
+
+    def _load_registry(self):
+        with self.registry_path.open("r", encoding="utf-8") as registry_file:
+            data = yaml.safe_load(registry_file) or {}
+
+        if not isinstance(data, dict):
+            raise ValueError("Schema registry YAML must contain a top-level mapping")
+
+        return data
+
+    @property
+    def db_schema_prompt(self):
+        return self._data.get("db_schema_prompt", "")
+
+    @property
+    def required_audit_columns(self):
+        return list(self._data.get("required_audit_columns", []))
+
+    def get_routing_patterns(self):
+        routing = self._data.get("routing", {})
+        patterns = routing.get("work_order_id_patterns", [])
+        return [pattern for pattern in patterns if isinstance(pattern, str)]
+
+    def match_work_order_id(self, text):
+        for pattern in self.get_routing_patterns():
+            match = re.search(pattern, text)
+            if match:
+                return match.group(0)
+
+        return None
+
+    def get_intents(self):
+        routing = self._data.get("routing", {})
+        intents = routing.get("intents", {})
+        return intents if isinstance(intents, dict) else {}
+
+    def iter_intents(self):
+        for intent_name, intent_config in self.get_intents().items():
+            if isinstance(intent_config, dict):
+                yield intent_name, intent_config
+
+    def get_intent(self, intent_name):
+        intent = self.get_intents().get(intent_name, {})
+        return intent if isinstance(intent, dict) else {}
+
+    def get_entity(self, entity_name):
+        entities = self._data.get("entities", {})
+        entity = entities.get(entity_name, {})
+        return entity if isinstance(entity, dict) else {}
+
+    def get_named_list(self, key_name):
+        values = self._data.get(key_name, [])
+        return list(values) if isinstance(values, list) else []
+
+    def get_entity_required_columns_ref(self, entity_name):
+        entity = self.get_entity(entity_name)
+        value = entity.get("required_columns_ref")
+        return value if isinstance(value, str) and value else None
+
+    def get_entity_keys(self, entity_name):
+        entity = self.get_entity(entity_name)
+
+        keys = entity.get("keys")
+        if isinstance(keys, list):
+            return [key for key in keys if isinstance(key, str)]
+
+        key = entity.get("key")
+        if isinstance(key, str) and key:
+            return [key]
+
+        return []

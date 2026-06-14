@@ -1,0 +1,26 @@
+from __future__ import annotations
+
+import io
+import re
+from contextlib import redirect_stdout
+from types import SimpleNamespace
+
+from falcon_wo_ai_agent import bootstrap_agent, print_report
+
+
+class _WoAgentWrapper:
+    def run(self, prompt: str):
+        match = re.search(r"[A-Z0-9][A-Z0-9_-]{5,}", prompt.upper())
+        work_order_id = match.group(0) if match else prompt.strip()
+
+        runtime = bootstrap_agent()
+        report = runtime.run(work_order_id)
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            print_report(report)
+
+        return SimpleNamespace(content=buffer.getvalue())
+
+
+wo_agent = _WoAgentWrapper()

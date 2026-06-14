@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Falcap Phi Chat</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/web/styles.css" />
+  </head>
+  <body>
+    <div class="bg-shape bg-shape-a"></div>
+    <div class="bg-shape bg-shape-b"></div>
+
+    <main class="app-shell">
+      <header class="app-header">
+        <h1>Falcap Phi Browser Chat</h1>
+        <p>Database investigation assistant with work order memory</p>
+      </header>
+
+      <section id="chat" class="chat-panel" aria-live="polite"></section>
+
+      <form id="chatForm" class="chat-form">
+        <label class="sr-only" for="prompt">Message</label>
+        <textarea
+          id="prompt"
+          rows="3"
+          placeholder="Ask about audit readiness, process flow, or pen diagnostics..."
+          required
+        ></textarea>
+        <div class="form-row">
+          <span id="sessionBadge" class="session-badge">Session: new</span>
+          <button id="sendBtn" type="submit">Send</button>
+        </div>
+      </form>
+    </main>
+
+    <script src="/web/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+ollama
+psycopg
+sqlalchemy
+streamlit
+python-dotenv
+PyYAML

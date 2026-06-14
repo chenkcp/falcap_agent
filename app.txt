@@ -1,0 +1,13 @@
+# app.py
+
+import streamlit as st
+from wo_agno_agent import wo_agent
+
+st.title("Falcon Work Order AI Debug Agent")
+
+work_order_id = st.text_input("Enter Work Order ID", "4HDMORG260423D1")
+
+if st.button("Run Debug"):
+    prompt = f"Debug this work order: {work_order_id}"
+    response = wo_agent.run(prompt)
+    st.markdown(response.content)

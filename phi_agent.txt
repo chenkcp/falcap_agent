@@ -1,0 +1,21 @@
+# wo_agno_agent.py
+
+import os
+
+from agno.agent import Agent
+from agno.models.ollama import Ollama
+from wo_tool import debug_work_order
+
+phi_agent = Agent(
+    name="Falcon WO Debug Agent",
+    model=Ollama(id=os.getenv("MODEL_NAME")),
+    tools=[debug_work_order],
+    instructions=[
+        "You are a Falcon work order debugging agent.",
+        "When the user gives a work order ID, call debug_work_order.",
+        "Do not invent SQL.",
+        "Do not guess missing data.",
+        "Explain the first breaking point clearly.",
+    ],
+    markdown=True,
+)

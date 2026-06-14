@@ -1,0 +1,827 @@
+"""
+falcon_wo_ai_agent.py
+
+Design:
+User gives WO
+-> AI selects diagnostic step
+-> Python runs approved SQL template
+-> AI explains result
+-> AI continues next step
+
+Install:
+  pip install sqlalchemy psycopg2-binary python-dotenv
+
+Run:
+  python falcon_wo_ai_agent.py 4HDMORG260423D1
+"""
+
+# ============================================================
+# 1. Config + bootstrap
+# ============================================================
+
+import os
+import sys
+import json
+from dataclasses import dataclass
+from typing import Any, Dict, List, Callable, Optional
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.engine import URL
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+@dataclass
+class AppConfig:
+    db_url: str
+    max_rows: int = 500
+    sql_timeout_seconds: int = 60
+    debug: bool = True
+
+
+def load_config() -> AppConfig:
+    db_url = os.getenv("FALCON_DB_URL")
+
+    if not db_url:
+        db_host = os.getenv("DB_HOST")
+        db_port = os.getenv("DB_PORT", "5432")
+        db_name = os.getenv("DB_NAME")
+        db_user = os.getenv("DB_USER")
+        db_password = os.getenv("DB_PASSWORD")
+
+        required_env = {
+            "DB_HOST": db_host,
+            "DB_NAME": db_name,
+            "DB_USER": db_user,
+            "DB_PASSWORD": db_password,
+        }
+        missing_env = [name for name, value in required_env.items() if not value]
+        if missing_env:
+            raise ValueError(
+                "Missing database configuration. Set FALCON_DB_URL or: "
+                + ", ".join(missing_env)
+            )
+
+        db_url = URL.create(
+            drivername="postgresql+psycopg2",
+            username=db_user,
+            password=db_password,
+            host=db_host,
+            port=int(db_port),
+            database=db_name,
+        ).render_as_string(hide_password=False)
+
+    return AppConfig(
+        db_url=db_url,
+        max_rows=int(os.getenv("MAX_ROWS", "500")),
+        sql_timeout_seconds=int(os.getenv("SQL_TIMEOUT_SECONDS", "60")),
+        debug=os.getenv("DEBUG", "true").lower() == "true",
+    )
+
+
+# ============================================================
+# 2. Infrastructure adapters
+# ============================================================
+
+class DbAdapter:
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.engine: Engine = create_engine(config.db_url, pool_pre_ping=True)
+
+    def fetch_all(self, sql: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        limited_sql = f"""
+        {sql}
+        LIMIT {self.config.max_rows}
+        """
+
+        with self.engine.connect() as conn:
+            result = conn.execute(text(limited_sql), params)
+            return [dict(row._mapping) for row in result]
+
+    def fetch_scalar(self, sql: str, params: Dict[str, Any]) -> Any:
+        with self.engine.connect() as conn:
+            result = conn.execute(text(sql), params)
+            row = result.fetchone()
+            if not row:
+                return None
+            return row[0]
+
+
+# ============================================================
+# 3. AI guardrails + router
+# ============================================================
+
+class Guardrails:
+    APPROVED_TOOLS = {
+        "check_work_order_ready",
+        "get_work_order_pens",
+        "check_wo_result_exists",
+        "get_pen_info",
+        "check_test_station_data",
+        "check_process_step_evidence",
+        "derive_ink_type",
+        "get_wo_audit_type",
+        "get_audit_constraints",
+        "get_raw_data_requirements",
+        "build_final_report",
+    }
+
+    @staticmethod
+    def validate_work_order_id(work_order_id: str) -> str:
+        if not work_order_id:
+            raise ValueError("work_order_id is required")
+
+        if not work_order_id.replace("-", "").replace("_", "").isalnum():
+            raise ValueError("Invalid work_order_id format")
+
+        return work_order_id.strip().upper()
+
+    @staticmethod
+    def validate_tool_name(tool_name: str) -> None:
+        if tool_name not in Guardrails.APPROVED_TOOLS:
+            raise ValueError(f"Tool not approved: {tool_name}")
+
+
+class Router:
+    """
+    This simulates AI routing.
+
+    In production, an LLM can choose the next tool,
+    but it must only choose from the approved tool registry.
+    """
+
+    FLOW = [
+        "check_work_order_ready",
+        "get_work_order_pens",
+        "check_wo_result_exists",
+        "get_pen_info",
+        "check_test_station_data",
+        "check_process_step_evidence",
+        "derive_ink_type",
+        "get_wo_audit_type",
+        "get_audit_constraints",
+        "get_raw_data_requirements",
+        "build_final_report",
+    ]
+
+    def next_tool(self, state: Dict[str, Any]) -> Optional[str]:
+        completed = state.get("completed_tools", [])
+
+        for tool_name in self.FLOW:
+            if tool_name not in completed:
+                Guardrails.validate_tool_name(tool_name)
+                return tool_name
+
+        return None
+
+
+# ============================================================
+# 4. Data query service: NL to SQL to DB
+# ============================================================
+
+class DataQueryService:
+    """
+    Controlled SQL execution service.
+
+    Important:
+    - AI does not generate SQL directly.
+    - AI selects a named tool.
+    - Tool calls approved SQL templates.
+    - Parameters are bound safely.
+    """
+
+    def __init__(self, db: DbAdapter):
+        self.db = db
+
+    def run_query(self, sql: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return self.db.fetch_all(sql, params)
+
+    def run_scalar(self, sql: str, params: Dict[str, Any]) -> Any:
+        return self.db.fetch_scalar(sql, params)
+
+
+# ============================================================
+# 5. Work-order data access
+# ============================================================
+
+class WorkOrderRepository:
+    def __init__(self, query_service: DataQueryService):
+        self.qs = query_service
+
+    def check_work_order_ready(self, wo: str) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT
+            WOD.work_order_id,
+            WOD.work_order_status_nm,
+            WOD.work_order_open_dm,
+            WOD.work_order_start_dm,
+            WOD.work_order_close_dm,
+            WOD.on_hold_fg,
+            WOD.comment_tx,
+            WOD.inv_item_dim_ky,
+            WOD.work_order_dest_nm,
+            WOD.prod_family_nm,
+            WOD.prod_family_dim_ky,
+            WOD.run_type_dim_ky
+        FROM RPTDS.WORK_ORDER_DIM WOD
+        JOIN RPTDS.INV_ITEM_DIM IID
+            ON IID.INV_ITEM_DIM_KY = WOD.INV_ITEM_DIM_KY
+        WHERE WOD.WORK_ORDER_STATUS_NM = 'Closed'
+          AND WOD.WORK_ORDER_DEST_NM = 'FGI'
+          AND WOD.UPDATE_DM > current_date - 270
+          AND IID.PART_TYPE_NM NOT IN ('DRY PEN', 'PEN BODY')
+          AND WOD.INV_ITEM_DIM_KY NOT IN (
+              '240540','462037','499139','470401','520140','537036',
+              '568836','649026','692348','727567','892317','763773'
+          )
+          AND WOD.WORK_ORDER_ID = :wo
+        """
+        return self.qs.run_query(sql, {"wo": wo})
+
+    def get_work_order_pens(self, wo: str) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT *
+        FROM falcon.pen_work_order
+        WHERE work_order_id = :wo
+        """
+        return self.qs.run_query(sql, {"wo": wo})
+
+    def check_wo_result_exists(self, wo: str) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT *
+        FROM rptds.fceolqt_wo_result_fact
+        WHERE work_order_id = :wo
+        """
+        return self.qs.run_query(sql, {"wo": wo})
+
+    def get_pen_info(self, wo: str) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT
+            pn_id,
+            arch_id,
+            odd_ink_color_nm,
+            odd_ink_type_nm,
+            even_ink_color_nm,
+            even_ink_type_nm,
+            mfg_inkfill_start_dm,
+            mfg_inkfill_end_dm
+        FROM rptds.pen_info_dim
+        WHERE last_affect_yld_work_order_id = :wo
+        """
+        return self.qs.run_query(sql, {"wo": wo})
+
+    def get_clouseau_rows(self, wo: str) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT *
+        FROM falcon.cl_main
+        WHERE test_req_id = :wo
+          AND test_pen_id IN (
+              SELECT DISTINCT pn_id
+              FROM rptds.pen_info_dim
+              WHERE last_affect_yld_work_order_id = :wo
+          )
+        """
+        return self.qs.run_query(sql, {"wo": wo})
+
+    def get_hueminator_rows(self, wo: str) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT *
+        FROM falcon.sample_analysis
+        WHERE job_id = :wo
+          AND sample_id IN (
+              SELECT DISTINCT pn_id
+              FROM rptds.pen_info_dim
+              WHERE last_affect_yld_work_order_id = :wo
+          )
+        """
+        return self.qs.run_query(sql, {"wo": wo})
+
+    def get_process_step_rows(self, wo: str) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT *
+        FROM rptds.pen_process_fact
+        WHERE pn_id IN (
+            SELECT pn_id
+            FROM falcon.pen_work_order
+            WHERE work_order_id = :wo
+        )
+        AND process_step_dim_ky IN (2129, 2130)
+        """
+        return self.qs.run_query(sql, {"wo": wo})
+
+    def derive_ink_type(self, wo: str) -> List[Dict[str, Any]]:
+        sql = """
+        WITH processed_pens AS (
+            SELECT
+                CASE
+                    WHEN odd_ink_color_nm = 'TRANSPARENT DETAILING AGENT'
+                        THEN even_ink_type_nm
+                    WHEN even_ink_color_nm = 'TRANSPARENT DETAILING AGENT'
+                        THEN odd_ink_type_nm
+                    WHEN even_ink_color_nm <> 'TRANSPARENT DETAILING AGENT'
+                     AND odd_ink_color_nm <> 'TRANSPARENT DETAILING AGENT'
+                     AND even_ink_color_nm = odd_ink_color_nm
+                        THEN odd_ink_type_nm
+                    WHEN even_ink_color_nm <> 'TRANSPARENT DETAILING AGENT'
+                     AND odd_ink_color_nm <> 'TRANSPARENT DETAILING AGENT'
+                     AND even_ink_color_nm <> odd_ink_color_nm
+                        THEN odd_ink_type_nm || '-' || even_ink_type_nm
+                END AS ink_dm,
+                *
+            FROM rptds.pen_info_dim
+            WHERE last_affect_yld_work_order_id = :wo
+        )
+        SELECT
+            pp.ink_dm,
+            itd.ink_type_cd,
+            itd.ink_type_dim_ky,
+            pp.pn_id,
+            pp.arch_id,
+            pp.odd_ink_color_nm,
+            pp.odd_ink_type_nm,
+            pp.even_ink_color_nm,
+            pp.even_ink_type_nm
+        FROM processed_pens pp
+        JOIN rptds.ink_type_dim itd
+            ON itd.ink_type_nm = pp.ink_dm
+        """
+        return self.qs.run_query(sql, {"wo": wo})
+
+    def get_wo_audit_type(self, arch_id: Any, ink_type_dim_ky: Any) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT
+            fceolqt_wo_type_dim_ky,
+            work_order_type_nm,
+            ink_type_dim_ky,
+            arch_id,
+            min_pen_ct,
+            days_to_process_wo_ct
+        FROM rptds.fceolqt_wo_type_dim
+        WHERE ink_type_dim_ky = :ink_type_dim_ky
+          AND arch_id::int = :arch_id
+        """
+        return self.qs.run_query(
+            sql,
+            {
+                "arch_id": int(arch_id),
+                "ink_type_dim_ky": int(ink_type_dim_ky),
+            },
+        )
+
+    def get_audit_constraints(self, wo_type_key: Any) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT
+            fceolqt_wo_test_cnstr_dim_ky,
+            fceolqt_test_criteria_dim_ky,
+            fceolqt_wo_type_dim_ky,
+            prod_color_dim_ky,
+            slot_type_cd,
+            constraint_centile_pct,
+            constraint_upper_bound_vl,
+            constraint_lower_bound_vl
+        FROM rptds.fceolqt_wo_test_cnstr_dim
+        WHERE fceolqt_wo_type_dim_ky = :wo_type_key
+        """
+        return self.qs.run_query(sql, {"wo_type_key": wo_type_key})
+
+    def get_raw_data_requirements(self, wo_type_key: Any) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT
+            fceolqt_test_criteria_dim_ky,
+            table_nm,
+            column_nm,
+            test_criteria_nm
+        FROM rptds.fceolqt_test_criteria_dim
+        WHERE fceolqt_test_criteria_dim_ky IN (
+            SELECT fceolqt_test_criteria_dim_ky
+            FROM rptds.fceolqt_wo_test_cnstr_dim
+            WHERE fceolqt_wo_type_dim_ky = :wo_type_key
+        )
+        """
+        return self.qs.run_query(sql, {"wo_type_key": wo_type_key})
+
+
+# ============================================================
+# 6. Domain tools: audit + flow
+# ============================================================
+
+class WorkOrderDomainTools:
+    def __init__(self, repo: WorkOrderRepository):
+        self.repo = repo
+
+    def check_work_order_ready(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        rows = self.repo.check_work_order_ready(state["work_order_id"])
+
+        state["work_order_ready_rows"] = rows
+        state["work_order_ready"] = len(rows) > 0
+
+        if rows:
+            state["explanations"].append("PASS: Work order is Closed, FGI, recent, valid part type, and not excluded.")
+        else:
+            state["explanations"].append("FAIL: Work order is not ready or does not match audit eligibility rules.")
+
+        return state
+
+    def get_work_order_pens(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        rows = self.repo.get_work_order_pens(state["work_order_id"])
+
+        state["work_order_pens"] = rows
+        state["work_order_pen_count"] = len({r.get("pn_id") for r in rows if r.get("pn_id")})
+
+        if rows:
+            state["explanations"].append(f"PASS: Found {state['work_order_pen_count']} linked pens in FALCON.PEN_WORK_ORDER.")
+        else:
+            state["explanations"].append("FAIL: No pens found in FALCON.PEN_WORK_ORDER. Data flow breaks at WO to pen linkage.")
+
+        return state
+
+    def check_wo_result_exists(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        rows = self.repo.check_wo_result_exists(state["work_order_id"])
+
+        state["wo_result_rows"] = rows
+        state["wo_result_exists"] = len(rows) > 0
+
+        if rows:
+            state["explanations"].append("PASS: WO result exists in RPTDS.FCEOLQT_WO_RESULT_FACT.")
+        else:
+            state["explanations"].append("WARN: WO result does not exist. Continue upstream checks to locate missing data.")
+
+        return state
+
+    def get_pen_info(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        rows = self.repo.get_pen_info(state["work_order_id"])
+
+        state["pen_info_rows"] = rows
+        state["pen_info_count"] = len({r.get("pn_id") for r in rows if r.get("pn_id")})
+
+        arch_ids = sorted({r.get("arch_id") for r in rows if r.get("arch_id")})
+        state["arch_ids"] = arch_ids
+
+        if rows:
+            state["explanations"].append(f"PASS: Found {state['pen_info_count']} pens in RPTDS.PEN_INFO_DIM. Arch IDs: {arch_ids}.")
+        else:
+            state["explanations"].append("FAIL: No pen info found. Cannot derive arch_id or ink type.")
+
+        return state
+
+    def check_test_station_data(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        cl_rows = self.repo.get_clouseau_rows(state["work_order_id"])
+        hm_rows = self.repo.get_hueminator_rows(state["work_order_id"])
+
+        cl_pens = {r.get("test_pen_id") for r in cl_rows if r.get("test_pen_id")}
+        hm_pens = {r.get("sample_id") for r in hm_rows if r.get("sample_id")}
+        pen_info_pens = {r.get("pn_id") for r in state.get("pen_info_rows", []) if r.get("pn_id")}
+
+        state["clouseau_count"] = len(cl_pens)
+        state["hueminator_count"] = len(hm_pens)
+        state["missing_clouseau_pens"] = sorted(list(pen_info_pens - cl_pens))[:50]
+        state["missing_hueminator_pens"] = sorted(list(pen_info_pens - hm_pens))[:50]
+
+        state["explanations"].append(
+            f"Clouseau evidence: {state['clouseau_count']} pens found in FALCON.CL_MAIN."
+        )
+        state["explanations"].append(
+            f"Hueminator evidence: {state['hueminator_count']} pens found in FALCON.SAMPLE_ANALYSIS."
+        )
+
+        if state["missing_clouseau_pens"]:
+            state["explanations"].append("WARN: Some pens are missing Clouseau data.")
+
+        if state["missing_hueminator_pens"]:
+            state["explanations"].append("WARN: Some pens are missing Hueminator data.")
+
+        return state
+
+    def check_process_step_evidence(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        rows = self.repo.get_process_step_rows(state["work_order_id"])
+
+        step_2129 = [r for r in rows if r.get("process_step_dim_ky") == 2129]
+        step_2130 = [r for r in rows if r.get("process_step_dim_ky") == 2130]
+
+        state["process_step_2129_count"] = len(step_2129)
+        state["process_step_2130_count"] = len(step_2130)
+
+        state["explanations"].append(
+            f"Process step 2129 Clouseau rows: {len(step_2129)}."
+        )
+        state["explanations"].append(
+            f"Process step 2130 Hueminator rows: {len(step_2130)}."
+        )
+
+        return state
+
+    def derive_ink_type(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        rows = self.repo.derive_ink_type(state["work_order_id"])
+
+        state["ink_type_rows"] = rows
+
+        pairs = sorted({
+            (r.get("arch_id"), r.get("ink_type_dim_ky"), r.get("ink_dm"))
+            for r in rows
+            if r.get("arch_id") and r.get("ink_type_dim_ky")
+        })
+
+        state["arch_ink_pairs"] = pairs
+
+        if pairs:
+            state["selected_arch_id"] = pairs[0][0]
+            state["selected_ink_type_dim_ky"] = pairs[0][1]
+            state["selected_ink_dm"] = pairs[0][2]
+            state["explanations"].append(
+                f"PASS: Derived ink mapping: arch_id={pairs[0][0]}, "
+                f"ink_type_dim_ky={pairs[0][1]}, ink_dm={pairs[0][2]}."
+            )
+        else:
+            state["explanations"].append("FAIL: Cannot map derived ink_dm to RPTDS.INK_TYPE_DIM.")
+
+        return state
+
+    def get_wo_audit_type(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        arch_id = state.get("selected_arch_id")
+        ink_type_dim_ky = state.get("selected_ink_type_dim_ky")
+
+        if not arch_id or not ink_type_dim_ky:
+            state["audit_type_rows"] = []
+            state["explanations"].append("SKIP: Missing arch_id or ink_type_dim_ky. Cannot find WO audit type.")
+            return state
+
+        rows = self.repo.get_wo_audit_type(arch_id, ink_type_dim_ky)
+        state["audit_type_rows"] = rows
+
+        if rows:
+            row = rows[0]
+            state["fceolqt_wo_type_dim_ky"] = row["fceolqt_wo_type_dim_ky"]
+            state["min_pen_ct"] = row["min_pen_ct"]
+            state["days_to_process_wo_ct"] = row["days_to_process_wo_ct"]
+
+            state["explanations"].append(
+                f"PASS: Found audit type {row['fceolqt_wo_type_dim_ky']}. "
+                f"Minimum pen count={row['min_pen_ct']}, "
+                f"days_to_process={row['days_to_process_wo_ct']}."
+            )
+        else:
+            state["explanations"].append("FAIL: No audit type found for arch_id + ink_type_dim_ky.")
+
+        return state
+
+    def get_audit_constraints(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        wo_type_key = state.get("fceolqt_wo_type_dim_ky")
+
+        if not wo_type_key:
+            state["constraint_rows"] = []
+            state["explanations"].append("SKIP: Missing fceolqt_wo_type_dim_ky. Cannot find constraints.")
+            return state
+
+        rows = self.repo.get_audit_constraints(wo_type_key)
+        state["constraint_rows"] = rows
+
+        if rows:
+            state["explanations"].append(f"PASS: Found {len(rows)} audit statistic constraints.")
+        else:
+            state["explanations"].append("FAIL: Audit type exists, but no statistic constraints are configured.")
+
+        return state
+
+    def get_raw_data_requirements(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        wo_type_key = state.get("fceolqt_wo_type_dim_ky")
+
+        if not wo_type_key:
+            state["raw_data_requirements"] = []
+            state["explanations"].append("SKIP: Missing fceolqt_wo_type_dim_ky. Cannot find raw data requirements.")
+            return state
+
+        rows = self.repo.get_raw_data_requirements(wo_type_key)
+        state["raw_data_requirements"] = rows
+
+        if rows:
+            state["explanations"].append(f"PASS: Found {len(rows)} raw audit data requirements.")
+        else:
+            state["explanations"].append("FAIL: No raw data table/column mapping found for audit criteria.")
+
+        return state
+
+    def build_final_report(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        failed = [x for x in state["explanations"] if x.startswith("FAIL")]
+        warnings = [x for x in state["explanations"] if x.startswith("WARN")]
+
+        if failed:
+            final_status = "FAIL"
+        elif warnings:
+            final_status = "WARN"
+        else:
+            final_status = "PASS"
+
+        state["final_report"] = {
+            "work_order_id": state["work_order_id"],
+            "final_status": final_status,
+            "pen_count": state.get("work_order_pen_count", 0),
+            "pen_info_count": state.get("pen_info_count", 0),
+            "clouseau_count": state.get("clouseau_count", 0),
+            "hueminator_count": state.get("hueminator_count", 0),
+            "process_step_2129_count": state.get("process_step_2129_count", 0),
+            "process_step_2130_count": state.get("process_step_2130_count", 0),
+            "arch_id": state.get("selected_arch_id"),
+            "ink_type_dim_ky": state.get("selected_ink_type_dim_ky"),
+            "ink_dm": state.get("selected_ink_dm"),
+            "fceolqt_wo_type_dim_ky": state.get("fceolqt_wo_type_dim_ky"),
+            "min_pen_ct": state.get("min_pen_ct"),
+            "days_to_process_wo_ct": state.get("days_to_process_wo_ct"),
+            "constraint_count": len(state.get("constraint_rows", [])),
+            "raw_requirement_count": len(state.get("raw_data_requirements", [])),
+            "explanations": state["explanations"],
+        }
+
+        return state
+
+
+# ============================================================
+# 7. Tool schema registry
+# ============================================================
+
+TOOL_SCHEMA_REGISTRY = {
+    "check_work_order_ready": {
+        "description": "Check if WO is Closed, FGI, recent, valid part type, and not excluded.",
+        "input": {"work_order_id": "string"},
+        "output": {"work_order_ready": "boolean"},
+    },
+    "get_work_order_pens": {
+        "description": "Get pens linked to the WO from FALCON.PEN_WORK_ORDER.",
+        "input": {"work_order_id": "string"},
+        "output": {"work_order_pen_count": "integer"},
+    },
+    "check_wo_result_exists": {
+        "description": "Check whether WO final audit result exists.",
+        "input": {"work_order_id": "string"},
+        "output": {"wo_result_exists": "boolean"},
+    },
+    "get_pen_info": {
+        "description": "Get pn_id, arch_id, odd/even ink color and type.",
+        "input": {"work_order_id": "string"},
+        "output": {"pen_info_count": "integer", "arch_ids": "array"},
+    },
+    "check_test_station_data": {
+        "description": "Check Clouseau and Hueminator station evidence.",
+        "input": {"work_order_id": "string"},
+        "output": {"clouseau_count": "integer", "hueminator_count": "integer"},
+    },
+    "check_process_step_evidence": {
+        "description": "Check process steps 2129 and 2130.",
+        "input": {"work_order_id": "string"},
+        "output": {"process_step_2129_count": "integer", "process_step_2130_count": "integer"},
+    },
+    "derive_ink_type": {
+        "description": "Derive ink_dm and map to ink_type_dim_ky.",
+        "input": {"work_order_id": "string"},
+        "output": {"arch_id": "integer", "ink_type_dim_ky": "integer"},
+    },
+    "get_wo_audit_type": {
+        "description": "Find WO audit type by arch_id and ink_type_dim_ky.",
+        "input": {"arch_id": "integer", "ink_type_dim_ky": "integer"},
+        "output": {"fceolqt_wo_type_dim_ky": "integer", "min_pen_ct": "integer"},
+    },
+    "get_audit_constraints": {
+        "description": "Get statistic constraints for WO audit type.",
+        "input": {"fceolqt_wo_type_dim_ky": "integer"},
+        "output": {"constraint_count": "integer"},
+    },
+    "get_raw_data_requirements": {
+        "description": "Get raw data source table and column required for audit calculation.",
+        "input": {"fceolqt_wo_type_dim_ky": "integer"},
+        "output": {"raw_requirement_count": "integer"},
+    },
+    "build_final_report": {
+        "description": "Build final engineering diagnosis report.",
+        "input": {"state": "object"},
+        "output": {"final_report": "object"},
+    },
+}
+
+
+# ============================================================
+# 8. Tool implementation registry
+# ============================================================
+
+def build_tool_registry(domain_tools: WorkOrderDomainTools) -> Dict[str, Callable]:
+    return {
+        "check_work_order_ready": domain_tools.check_work_order_ready,
+        "get_work_order_pens": domain_tools.get_work_order_pens,
+        "check_wo_result_exists": domain_tools.check_wo_result_exists,
+        "get_pen_info": domain_tools.get_pen_info,
+        "check_test_station_data": domain_tools.check_test_station_data,
+        "check_process_step_evidence": domain_tools.check_process_step_evidence,
+        "derive_ink_type": domain_tools.derive_ink_type,
+        "get_wo_audit_type": domain_tools.get_wo_audit_type,
+        "get_audit_constraints": domain_tools.get_audit_constraints,
+        "get_raw_data_requirements": domain_tools.get_raw_data_requirements,
+        "build_final_report": domain_tools.build_final_report,
+    }
+
+
+# ============================================================
+# 9. Agent policy prompt
+# ============================================================
+
+AGENT_POLICY_PROMPT = """
+You are a Falcon Work Order Debugging AI Agent.
+
+Rules:
+1. Do not write free-form SQL.
+2. Only select tools from TOOL_SCHEMA_REGISTRY.
+3. Run tools in dependency order.
+4. Use parameterized SQL only.
+5. Explain each result in engineering language.
+6. Continue checking upstream data when WO result fact is missing.
+7. Clearly separate PASS, WARN, FAIL, and SKIP.
+8. Do not guess missing arch_id, ink_type_dim_ky, or audit type.
+9. If process step Clouseau is expected to be 2129, flag SQL using 212 as suspicious.
+10. Final output must show the first breaking point in the WO data flow.
+"""
+
+
+# ============================================================
+# 10. Runtime orchestration loop
+# ============================================================
+
+class WorkOrderAgentRuntime:
+    def __init__(self, router: Router, tool_registry: Dict[str, Callable]):
+        self.router = router
+        self.tool_registry = tool_registry
+
+    def run(self, work_order_id: str) -> Dict[str, Any]:
+        wo = Guardrails.validate_work_order_id(work_order_id)
+
+        state: Dict[str, Any] = {
+            "work_order_id": wo,
+            "completed_tools": [],
+            "explanations": [],
+            "agent_policy": AGENT_POLICY_PROMPT,
+        }
+
+        while True:
+            tool_name = self.router.next_tool(state)
+
+            if tool_name is None:
+                break
+
+            Guardrails.validate_tool_name(tool_name)
+
+            tool_fn = self.tool_registry[tool_name]
+            state = tool_fn(state)
+            state["completed_tools"].append(tool_name)
+
+        return state["final_report"]
+
+
+def print_report(report: Dict[str, Any]) -> None:
+    print("\nWORK ORDER DEBUG REPORT")
+    print("=" * 80)
+    print(f"WO: {report['work_order_id']}")
+    print(f"Final Status: {report['final_status']}")
+    print("-" * 80)
+
+    print(f"WO Pen Count: {report['pen_count']}")
+    print(f"Pen Info Count: {report['pen_info_count']}")
+    print(f"Clouseau Count: {report['clouseau_count']}")
+    print(f"Hueminator Count: {report['hueminator_count']}")
+    print(f"Process Step 2129 Count: {report['process_step_2129_count']}")
+    print(f"Process Step 2130 Count: {report['process_step_2130_count']}")
+    print(f"Arch ID: {report['arch_id']}")
+    print(f"Ink Type Dim Key: {report['ink_type_dim_ky']}")
+    print(f"Ink DM: {report['ink_dm']}")
+    print(f"WO Type Dim Key: {report['fceolqt_wo_type_dim_ky']}")
+    print(f"Minimum Pen Count: {report['min_pen_ct']}")
+    print(f"Days To Process WO: {report['days_to_process_wo_ct']}")
+    print(f"Constraint Count: {report['constraint_count']}")
+    print(f"Raw Requirement Count: {report['raw_requirement_count']}")
+
+    print("\nDiagnosis Steps")
+    print("-" * 80)
+
+    for line in report["explanations"]:
+        print(f"- {line}")
+
+
+def bootstrap_agent() -> WorkOrderAgentRuntime:
+    config = load_config()
+    db = DbAdapter(config)
+    query_service = DataQueryService(db)
+    repo = WorkOrderRepository(query_service)
+    domain_tools = WorkOrderDomainTools(repo)
+    tool_registry = build_tool_registry(domain_tools)
+    router = Router()
+
+    return WorkOrderAgentRuntime(router, tool_registry)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python falcon_wo_ai_agent.py <WORK_ORDER_ID>")
+        sys.exit(1)
+
+    work_order_id = sys.argv[1]
+
+    agent = bootstrap_agent()
+    final_report = agent.run(work_order_id)
+
+    print_report(final_report)

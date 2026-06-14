@@ -1,0 +1,277 @@
+import json
+import uuid
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import ollama
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+import phi_agent #web_server.py imports phi_agent.py and calls its router, tool registry, prompt, and tool functions.
+
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+
+
+class ChatResponse(BaseModel):
+    session_id: str
+    answer: str
+
+
+class SessionState:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = [
+            {"role": "system", "content": phi_agent.SYSTEM_PROMPT}
+        ]
+        self.last_work_order_id: str | None = None
+
+
+app = FastAPI(title="Falcap Phi Browser Chat")
+
+WEB_DIR = Path(__file__).with_name("web")
+app.mount("/web", StaticFiles(directory=str(WEB_DIR)), name="web")
+
+SESSIONS: dict[str, SessionState] = {}
+
+
+def get_session(session_id: str | None) -> tuple[str, SessionState]:
+    if session_id and session_id in SESSIONS:
+        return session_id, SESSIONS[session_id]
+
+    new_id = str(uuid.uuid4())
+    state = SessionState()
+    SESSIONS[new_id] = state
+    return new_id, state
+
+
+def normalize_tool_args(raw_args: Any) -> dict[str, Any]:
+    if raw_args is None:
+        return {}
+
+    if isinstance(raw_args, dict):
+        return dict(raw_args)
+
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    return {}
+
+
+def execute_tool_for_session(
+    session: SessionState,
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> str:
+    """Execute a tool with session-aware work-order context propagation."""
+    phi_agent.LAST_WORK_ORDER_ID = session.last_work_order_id
+
+    tool_args = phi_agent._apply_default_work_order_id(tool_name, dict(tool_args))
+
+    if "work_order_id" in tool_args and tool_args["work_order_id"]:
+        session.last_work_order_id = str(tool_args["work_order_id"])
+        phi_agent.LAST_WORK_ORDER_ID = session.last_work_order_id
+
+    tool_function = phi_agent.available_tools.get(tool_name)
+    if not tool_function:
+        return f"Unknown tool: {tool_name}"
+
+    try:
+        return str(tool_function(**tool_args))
+    except Exception as exc:
+        return f"Tool execution error: {str(exc)}"
+
+
+def _switch_orchestrator_route(
+    session: SessionState,
+    user_input: str,
+) -> dict[str, Any] | None:
+    """
+    Single orchestrator switch for turn routing.
+
+    This function centralizes the branch decision between:
+    1) deterministic routing (policy/keyword/work-order aware), and
+    2) model-driven tool selection.
+
+    Returning a dict means the deterministic lane is selected.
+    Returning None means the model lane should be used.
+    """
+    phi_agent._remember_work_order_id_from_text(user_input)
+    session.last_work_order_id = phi_agent.LAST_WORK_ORDER_ID
+
+    phi_agent.LAST_WORK_ORDER_ID = session.last_work_order_id
+    return phi_agent.route_user_request(user_input)
+
+
+def _run_model_lane(session: SessionState, user_input: str) -> str:
+    """Run the model tool-calling lane when deterministic routing has no match."""
+    session.messages.append({"role": "user", "content": user_input})
+
+    response = ollama.chat(model=phi_agent.MODEL, messages=session.messages, tools=phi_agent.tools)
+    message = response["message"]
+
+    if message.get("tool_calls"):
+        session.messages.append(message)
+
+        for tool_call in message["tool_calls"]:
+            tool_name = str(tool_call["function"]["name"])
+            tool_args = normalize_tool_args(tool_call["function"].get("arguments"))
+            tool_result = execute_tool_for_session(session, tool_name, tool_args)
+            session.messages.append({"role": "tool", "content": str(tool_result)})
+
+        final_response = ollama.chat(model=phi_agent.MODEL, messages=session.messages)
+        final_message = str(final_response["message"]["content"])
+        session.messages.append({"role": "assistant", "content": final_message})
+        return final_message
+
+    fake_call = phi_agent.parse_text_tool_call(str(message.get("content", "")))
+    if fake_call:
+        tool_name = str(fake_call["name"])
+        tool_args = normalize_tool_args(fake_call.get("arguments"))
+        tool_result = execute_tool_for_session(session, tool_name, tool_args)
+
+        session.messages.append({"role": "assistant", "content": str(message.get("content", ""))})
+        session.messages.append({"role": "tool", "content": str(tool_result)})
+
+        final_response = ollama.chat(model=phi_agent.MODEL, messages=session.messages)
+        final_message = str(final_response["message"]["content"])
+        session.messages.append({"role": "assistant", "content": final_message})
+        return final_message
+
+    assistant_text = str(message.get("content", ""))
+    session.messages.append({"role": "assistant", "content": assistant_text})
+    return assistant_text
+
+
+def _run_model_lane_stream(session: SessionState, user_input: str) -> Iterator[str]:
+    """Streaming equivalent of the model tool-calling lane."""
+    session.messages.append({"role": "user", "content": user_input})
+
+    response = ollama.chat(model=phi_agent.MODEL, messages=session.messages, tools=phi_agent.tools)
+    message = response["message"]
+
+    if message.get("tool_calls"):
+        session.messages.append(message)
+
+        for tool_call in message["tool_calls"]:
+            tool_name = str(tool_call["function"]["name"])
+            tool_args = normalize_tool_args(tool_call["function"].get("arguments"))
+            tool_result = execute_tool_for_session(session, tool_name, tool_args)
+            session.messages.append({"role": "tool", "content": str(tool_result)})
+
+        yield from _stream_final_assistant_message(session)
+        return
+
+    fake_call = phi_agent.parse_text_tool_call(str(message.get("content", "")))
+    if fake_call:
+        tool_name = str(fake_call["name"])
+        tool_args = normalize_tool_args(fake_call.get("arguments"))
+        tool_result = execute_tool_for_session(session, tool_name, tool_args)
+
+        session.messages.append({"role": "assistant", "content": str(message.get("content", ""))})
+        session.messages.append({"role": "tool", "content": str(tool_result)})
+
+        yield from _stream_final_assistant_message(session)
+        return
+
+    assistant_text = str(message.get("content", ""))
+    session.messages.append({"role": "assistant", "content": assistant_text})
+    yield _ndjson_event({"type": "delta", "text": assistant_text})
+
+
+# Entry point
+def run_agent_turn(session: SessionState, user_input: str) -> str:
+    """Synchronous turn handler using the single orchestrator switch."""
+    routed_call = _switch_orchestrator_route(session, user_input)
+
+    if routed_call:
+        if routed_call.get("type") == "hint":
+            return str(routed_call["message"])
+
+        return execute_tool_for_session(
+            session,
+            str(routed_call["name"]),
+            normalize_tool_args(routed_call.get("arguments")),
+        )
+
+    return _run_model_lane(session, user_input)
+
+
+def _ndjson_event(payload: dict[str, Any]) -> str:
+    return json.dumps(payload) + "\n"
+
+
+def _stream_final_assistant_message(session: SessionState) -> Iterator[str]:
+    final_parts: list[str] = []
+    stream = ollama.chat(model=phi_agent.MODEL, messages=session.messages, stream=True)
+    for chunk in stream:
+        text = str(chunk.get("message", {}).get("content", ""))
+        if text:
+            final_parts.append(text)
+            yield _ndjson_event({"type": "delta", "text": text})
+
+    final_message = "".join(final_parts)
+    session.messages.append({"role": "assistant", "content": final_message})
+
+
+def run_agent_turn_stream(session: SessionState, user_input: str) -> Iterator[str]:
+    """Streaming turn handler using the same orchestrator switch."""
+    routed_call = _switch_orchestrator_route(session, user_input)
+
+    if routed_call:
+        if routed_call.get("type") == "hint":
+            yield _ndjson_event({"type": "delta", "text": str(routed_call["message"])})
+            return
+
+        tool_result = execute_tool_for_session(
+            session,
+            str(routed_call["name"]),
+            normalize_tool_args(routed_call.get("arguments")),
+        )
+        yield _ndjson_event({"type": "delta", "text": str(tool_result)})
+        return
+
+    yield from _run_model_lane_stream(session, user_input)
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(str(WEB_DIR / "index.html"))
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+def chat(req: ChatRequest) -> ChatResponse:
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="message cannot be empty")
+
+    session_id, session = get_session(req.session_id)
+    answer = run_agent_turn(session, req.message)
+
+    return ChatResponse(session_id=session_id, answer=answer)
+
+
+@app.post("/api/chat/stream")
+def chat_stream(req: ChatRequest) -> StreamingResponse:
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="message cannot be empty")
+
+    session_id, session = get_session(req.session_id)
+
+    def event_stream() -> Iterator[str]:
+        yield _ndjson_event({"type": "session", "session_id": session_id})
+        try:
+            yield from run_agent_turn_stream(session, req.message)
+            yield _ndjson_event({"type": "done"})
+        except Exception as exc:
+            yield _ndjson_event({"type": "error", "error": str(exc)})
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
